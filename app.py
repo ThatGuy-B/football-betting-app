@@ -1,3 +1,4 @@
+```python
 import streamlit as st
 import pandas as pd
 import requests
@@ -16,14 +17,21 @@ def fetch_api(endpoint, params={}):
         'x-rapidapi-host': 'v3.football.api-sports.io',
         'x-rapidapi-key': API_KEY
     }
-    response = requests.get(url, headers=headers, params=params)
-    if response.status_code == 200:
-        data = response.json().get('response', [])
-        if not data:
-            st.warning(f"Empty response from API for endpoint: {endpoint}, params: {params}")
-        return data
-    else:
-        st.error(f"API error for endpoint {endpoint}: {response.status_code} - {response.text}")
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json().get('response', [])
+            if not data:
+                st.warning(f"Empty response from API for endpoint: {endpoint}, params: {params}")
+            return data
+        elif response.status_code == 429:
+            st.error(f"Rate limit exceeded for endpoint {endpoint}. Check your API plan.")
+            return []
+        else:
+            st.error(f"API error for endpoint {endpoint}: {response.status_code} - {response.text}")
+            return []
+    except requests.RequestException as e:
+        st.error(f"Request failed for endpoint {endpoint}: {str(e)}")
         return []
 
 # League options
@@ -44,21 +52,25 @@ season = datetime.datetime.now().year
 @st.cache_data(ttl=3600)
 def get_predictions(league_id, season):
     historical_matches = []
-    for past_season in range(season - 3, season):
+    # Limit to one past season to reduce API calls and avoid rate limits
+    for past_season in range(season - 1, season):
         matches = fetch_api('fixtures', {'league': league_id, 'season': past_season})
+        if not matches:
+            st.warning(f"No matches found for league {league_id}, season {past_season}")
+            continue
         historical_matches.extend(matches)
 
     data = []
     for match in historical_matches:
-        if match['fixture']['status']['short'] != 'FT': 
+        if match['fixture']['status']['short'] != 'FT':
             continue
         match_id = match['fixture']['id']
         home_id = match['teams']['home']['id']
         away_id = match['teams']['away']['id']
         date = pd.to_datetime(match['fixture']['date'])
 
+        # Fetch statistics and handle empty/missing data
         stats = fetch_api('fixtures/statistics', {'fixture': match_id}) or [{}]*2
-        # Skip matches with missing or invalid statistics
         if not stats or not stats[0].get('statistics') or (len(stats) > 1 and not stats[1].get('statistics')):
             st.warning(f"Skipping match {match_id} due to missing statistics")
             continue
@@ -77,7 +89,7 @@ def get_predictions(league_id, season):
         fouls_home = next((s['value'] for s in home_stats if s['type'] == 'Fouls'), 0)
         shots_on_target_home = next((s['value'] for s in home_stats if s['type'] == 'Shots on Goal'), 0)
         offsides_home = next((s['value'] for s in home_stats if s['type'] == 'Offsides'), 0)
-        home_injuries = sum(1 for i in injuries if i['player']['team'] == home_id)
+        home_injuries = sum(1 for i in injuries if i['player'].get('team') == home_id) if injuries else 0
 
         # Half-time stats (approximate from events if available)
         first_half_goals = sum(1 for e in events if e['type'] == 'Goal' and e['time']['elapsed'] <= 45)
@@ -106,6 +118,10 @@ def get_predictions(league_id, season):
             'clean_sheet_home': 1 if match['goals']['away'] == 0 else 0,
         }
         data.append(row)
+
+    if not data:
+        st.error("No valid matches found with complete data. Try a different league or season.")
+        return pd.DataFrame()
 
     df = pd.DataFrame(data)
     le = LabelEncoder()
@@ -138,6 +154,10 @@ def get_predictions(league_id, season):
         df.at[i, 'h2h_home_wins'] = h2h_wins(row['HomeID'], row['AwayID'], row['Date'], h2h_list)
 
     df = df.dropna()
+    if df.empty:
+        st.error("No valid matches after processing. Try a different league or season.")
+        return pd.DataFrame()
+
     features = ['HomeTeam', 'AwayTeam', 'home_form', 'away_form', 'h2h_home_wins', 'possession_home', 'shots_home', 'home_injuries']
 
     # Train models for each market
@@ -210,7 +230,7 @@ def get_predictions(league_id, season):
         h2h_wins_val = h2h_wins(home_id, away_id, date, h2h)
         possession_home = 50
         shots_home = 10
-        home_injuries_val = sum(1 for i in injuries if i['player']['team'] == home_id)
+        home_injuries_val = sum(1 for i in injuries if i['player'].get('team') == home_id) if injuries else 0
 
         new_match = pd.DataFrame({
             'HomeTeam': le.transform([home_team])[0] if home_team in le.classes_ else 0,
@@ -278,3 +298,4 @@ if st.button("Get Predictions"):
             st.dataframe(pred_df)
         else:
             st.warning("No upcoming matches found.")
+```
