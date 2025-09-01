@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import requests
@@ -10,7 +9,7 @@ import datetime
 # API Key from secrets
 API_KEY = st.secrets['API_KEY']
 
-# Fetch function
+# Fetch function with improved error logging
 def fetch_api(endpoint, params={}):
     url = f"https://v3.football.api-sports.io/{endpoint}"
     headers = {
@@ -19,9 +18,12 @@ def fetch_api(endpoint, params={}):
     }
     response = requests.get(url, headers=headers, params=params)
     if response.status_code == 200:
-        return response.json()['response']
+        data = response.json().get('response', [])
+        if not data:
+            st.warning(f"Empty response from API for endpoint: {endpoint}, params: {params}")
+        return data
     else:
-        st.error(f"Error: {response.text}")
+        st.error(f"API error for endpoint {endpoint}: {response.status_code} - {response.text}")
         return []
 
 # League options
@@ -48,20 +50,26 @@ def get_predictions(league_id, season):
 
     data = []
     for match in historical_matches:
-        if match['fixture']['status']['short'] != 'FT': continue
+        if match['fixture']['status']['short'] != 'FT': 
+            continue
         match_id = match['fixture']['id']
         home_id = match['teams']['home']['id']
         away_id = match['teams']['away']['id']
         date = pd.to_datetime(match['fixture']['date'])
 
         stats = fetch_api('fixtures/statistics', {'fixture': match_id}) or [{}]*2
+        # Skip matches with missing or invalid statistics
+        if not stats or not stats[0].get('statistics') or (len(stats) > 1 and not stats[1].get('statistics')):
+            st.warning(f"Skipping match {match_id} due to missing statistics")
+            continue
+
         lineups = fetch_api('fixtures/lineups', {'fixture': match_id}) or []
         injuries = fetch_api('injuries', {'league': league_id, 'season': past_season}) or []
         h2h = fetch_api('fixtures/headtohead', {'h2h': f"{home_id}-{away_id}"}) or []
         events = fetch_api('fixtures/events', {'fixture': match_id}) or []
 
-        home_stats = stats[0]['statistics'] if stats else []
-        away_stats = stats[1]['statistics'] if len(stats) > 1 else []
+        home_stats = stats[0].get('statistics', [])
+        away_stats = stats[1].get('statistics', []) if len(stats) > 1 else []
         possession_home = next((s['value'] for s in home_stats if s['type'] == 'Ball Possession'), 50)
         shots_home = next((s['value'] for s in home_stats if s['type'] == 'Total Shots'), 0)
         corners_home = next((s['value'] for s in home_stats if s['type'] == 'Corner Kicks'), 0)
@@ -147,12 +155,24 @@ def get_predictions(league_id, season):
     models['goals'].fit(X, y_goals)
 
     # Corners
-    y_corners = df['corners_home'] + [next((s['value'] for s in stats[1]['statistics'] if s['type'] == 'Corner Kicks'), 0) for stats in [fetch_api('fixtures/statistics', {'fixture': m['fixture']['id']}) or [{}]*2 for m in historical_matches[:len(df)]]]
+    y_corners = df['corners_home'] + [
+        next((s['value'] for s in stats[1].get('statistics', []) if s['type'] == 'Corner Kicks'), 0)
+        for stats in [
+            fetch_api('fixtures/statistics', {'fixture': m['fixture']['id']}) or [{}]*2
+            for m in historical_matches[:len(df)]
+        ]
+    ]
     models['corners'] = RandomForestRegressor(n_estimators=100, random_state=42)
     models['corners'].fit(X, y_corners[:len(X)])
 
     # Cards
-    y_cards = df['cards_home'] + [next((s['value'] for s in stats[1]['statistics'] if s['type'] == 'Yellow Cards'), 0) for stats in [fetch_api('fixtures/statistics', {'fixture': m['fixture']['id']}) or [{}]*2 for m in historical_matches[:len(df)]]]
+    y_cards = df['cards_home'] + [
+        next((s['value'] for s in stats[1].get('statistics', []) if s['type'] == 'Yellow Cards'), 0)
+        for stats in [
+            fetch_api('fixtures/statistics', {'fixture': m['fixture']['id']}) or [{}]*2
+            for m in historical_matches[:len(df)]
+        ]
+    ]
     models['cards'] = RandomForestRegressor(n_estimators=100, random_state=42)
     models['cards'].fit(X, y_cards[:len(X)])
 
@@ -227,7 +247,6 @@ def get_predictions(league_id, season):
         top_scorer = "Unknown"
         if lineups:
             home_players = [p['player']['name'] for p in lineups[0]['startXI']] if lineups else []
-            # Placeholder: Assume top scorer from team stats (needs player endpoint)
             top_scorer = home_players[0] if home_players else "Unknown"
 
         predictions.append({
@@ -244,8 +263,8 @@ def get_predictions(league_id, season):
             'Second Half Goals': round(second_half_goals_pred, 1),
             'Asian Handicap': f"Home {round(goal_diff_pred, 1)}" if goal_diff_pred > 0 else f"Away {round(-goal_diff_pred, 1)}",
             'Clean Sheet (Home)': 'Yes' if clean_sheet_pred == 1 else 'No',
-            'First Goal Scorer': top_scorer,  # Simplified
-            'Exact Score': f"{int(round(goals_pred/2))}:{int(round(goals_pred/2))}"  # Basic estimate
+            'First Goal Scorer': top_scorer,
+            'Exact Score': f"{int(round(goals_pred/2))}:{int(round(goals_pred/2))}"
         })
 
     return pd.DataFrame(predictions)
